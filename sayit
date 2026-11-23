@@ -1,0 +1,339 @@
+#!/usr/bin/env bash
+# sayit —— 命令行语音播报：自然音色、缓存秒播、边播边合成、断网自动回退
+# 版本 1.0.0 · Apache-2.0 · https://github.com/q4tv28s7yb-oss/sayit
+set -uo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)
+VERSION="1.0.0"
+
+SAYIT_HOME=${SAYIT_HOME:-$HOME/.sayit}
+# 兼容早期的 ~/.tts-venv 布局
+if [ ! -d "$SAYIT_HOME/venv" ] && [ -d "$HOME/.tts-venv/venv" ]; then SAYIT_HOME="$HOME/.tts-venv"; fi
+
+CONF="$SAYIT_HOME/config.env"
+LEX="$SAYIT_HOME/lexicon.txt"
+
+pick_file() {  # 依次在 $SAYIT_HOME/lib、$SAYIT_HOME、脚本同级 lib 下找辅助脚本
+  local f
+  for f in "$SAYIT_HOME/lib/$1" "$SAYIT_HOME/$1" "$SCRIPT_DIR/lib/$1"; do
+    [ -f "$f" ] && { printf '%s' "$f"; return 0; }
+  done
+  return 1
+}
+NORM="$(pick_file normalize.py || true)"
+CHUNK="$(pick_file chunk.py || true)"
+
+if [ -x "$SAYIT_HOME/venv/bin/python" ]; then PY="$SAYIT_HOME/venv/bin/python"; else PY="$(command -v python3 || true)"; fi
+if [ -x "$SAYIT_HOME/venv/bin/edge-tts" ]; then TTS_BIN="$SAYIT_HOME/venv/bin/edge-tts"; else TTS_BIN="$(command -v edge-tts || true)"; fi
+
+if [ -n "${SAYIT_CACHE:-}" ]; then CACHE="$SAYIT_CACHE"
+elif [ "$(uname -s)" = "Darwin" ]; then CACHE="$HOME/Library/Caches/sayit"
+else CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/sayit"; fi
+PIDF="$CACHE/.playing"
+mkdir -p "$CACHE" 2>/dev/null
+
+DEF_VOICE="zh-CN-XiaoxiaoNeural"
+DEF_RATE="+8%"
+DEF_PITCH="+0Hz"
+DEF_GAIN=""
+DEF_TIMEOUT="12"
+DEF_CHUNK_MIN="80"
+DEF_FALLBACK_VOICE="Tingting"
+DEF_FALLBACK_RATE="180"
+
+# 环境变量 > config.env > 内置默认值
+E_VOICE="${TTS_VOICE:-}"; E_RATE="${TTS_RATE:-}"; E_PITCH="${TTS_PITCH:-}"; E_GAIN="${TTS_GAIN:-}"
+TTS_VOICE="$DEF_VOICE"; TTS_RATE="$DEF_RATE"; TTS_PITCH="$DEF_PITCH"; TTS_GAIN="$DEF_GAIN"
+TTS_TIMEOUT="$DEF_TIMEOUT"; TTS_CHUNK_MIN="$DEF_CHUNK_MIN"
+TTS_FALLBACK_VOICE="$DEF_FALLBACK_VOICE"; TTS_FALLBACK_RATE="$DEF_FALLBACK_RATE"
+[ -f "$CONF" ] && . "$CONF"
+[ -n "$E_VOICE" ] && TTS_VOICE="$E_VOICE"
+[ -n "$E_RATE" ] && TTS_RATE="$E_RATE"
+[ -n "$E_PITCH" ] && TTS_PITCH="$E_PITCH"
+[ -n "$E_GAIN" ] && TTS_GAIN="$E_GAIN"
+
+# 播放器探测（可用 SAYIT_PLAYER 指定绝对路径覆盖）
+detect_player() {
+  local c
+  if [ -n "${SAYIT_PLAYER:-}" ]; then printf '%s' "$SAYIT_PLAYER"; return 0; fi
+  for c in afplay paplay aplay ffplay mpv play; do
+    command -v "$c" >/dev/null 2>&1 && { printf '%s' "$c"; return 0; }
+  done
+  return 1
+}
+PLAYER="$(detect_player || true)"
+
+BG=0; NO_NET=0; NO_CACHE=0; INTERRUPT=0; DEBUG=0
+
+log() { [ "$DEBUG" -eq 1 ] && printf 'sayit: %s\n' "$*" >&2; return 0; }
+
+norm_rate() {
+  local r="$1"
+  case "$r" in *%) ;; *) r="${r}%" ;; esac
+  case "$r" in +*|-*) ;; *) r="+$r" ;; esac
+  printf '%s' "$r"
+}
+
+playing() {
+  [ -s "$PIDF" ] || return 1
+  local p; p="$(cat "$PIDF" 2>/dev/null)"
+  [ -n "$p" ] && kill -0 "$p" 2>/dev/null
+}
+
+stop_player() {
+  if playing; then kill "$(cat "$PIDF")" 2>/dev/null; sleep 0.15; fi
+  rm -f "$PIDF"
+}
+
+wait_player() {
+  local n=0
+  while playing; do
+    n=$((n + 1))
+    [ "$n" -gt 150 ] && break
+    sleep 0.1
+  done
+}
+
+synth() {  # $1 文本  $2 输出文件
+  [ -z "$TTS_BIN" ] && return 1
+  local cmd=("$TTS_BIN" --voice "$TTS_VOICE" --rate="$TTS_RATE" --pitch="$TTS_PITCH" --text "$1" --write-media "$2")
+  if command -v perl >/dev/null 2>&1; then
+    perl -e 'alarm shift; exec @ARGV' "$TTS_TIMEOUT" "${cmd[@]}" >/dev/null 2>>"$CACHE/last-error.log"
+  else
+    "${cmd[@]}" >/dev/null 2>>"$CACHE/last-error.log"
+  fi
+}
+
+fallback_say() {
+  local text="$1"
+  case "$(uname -s)" in
+    Darwin)
+      if command -v say >/dev/null 2>&1; then
+        if say -v '?' 2>/dev/null | grep -q "^${TTS_FALLBACK_VOICE} "; then
+          say -v "$TTS_FALLBACK_VOICE" -r "$TTS_FALLBACK_RATE" "$text"
+        else
+          say "$text"
+        fi
+      fi ;;
+    *)
+      if command -v espeak-ng >/dev/null 2>&1; then
+        espeak-ng -v cmn -s "$TTS_FALLBACK_RATE" "$text"
+      elif command -v espeak >/dev/null 2>&1; then
+        espeak -v zh -s "$TTS_FALLBACK_RATE" "$text"
+      fi ;;
+  esac
+  return 0
+}
+
+play_file() {
+  local f="$1" rc=0
+  if playing; then
+    if [ "$INTERRUPT" -eq 1 ]; then stop_player; else wait_player; fi
+  fi
+  [ -z "$PLAYER" ] && { log "未找到播放器（afplay/paplay/aplay/ffplay/mpv/play）"; return 1; }
+  printf '%s' "$$" > "$PIDF"
+  case "$(basename "$PLAYER")" in
+    afplay)
+      if [ -n "$TTS_GAIN" ]; then "$PLAYER" -v "$TTS_GAIN" "$f" || rc=$?; else "$PLAYER" "$f" || rc=$?; fi ;;
+    ffplay)
+      "$PLAYER" -nodisp -autoexit -loglevel quiet "$f" || rc=$? ;;
+    mpv)
+      if [ -n "$TTS_GAIN" ]; then
+        "$PLAYER" --no-video --really-quiet --volume="$(awk -v g="$TTS_GAIN" 'BEGIN{printf "%d", g*100}')" "$f" || rc=$?
+      else
+        "$PLAYER" --no-video --really-quiet "$f" || rc=$?
+      fi ;;
+    *)
+      "$PLAYER" "$f" || rc=$? ;;
+  esac
+  rm -f "$PIDF"
+  return $rc
+}
+
+cache_key() { printf '%s|%s|%s|%s' "$TTS_VOICE" "$TTS_RATE" "$TTS_PITCH" "$1" | md5 -q 2>/dev/null || printf '%s|%s|%s|%s' "$TTS_VOICE" "$TTS_RATE" "$TTS_PITCH" "$1" | md5sum | cut -d' ' -f1; }
+
+chunk_file() { printf '%s/%s.mp3' "$CACHE" "$(cache_key "$1")"; }
+
+ensure_chunk() {
+  local text="$1" mp3 tmp
+  mp3="$(chunk_file "$text")"
+  if [ "$NO_CACHE" -eq 0 ] && [ -s "$mp3" ]; then log "缓存命中 ${text:0:12}…"; return 0; fi
+  tmp="$CACHE/.$(basename "$mp3").part"
+  rm -f "$tmp"
+  if synth "$text" "$tmp" && [ -s "$tmp" ]; then
+    mv -f "$tmp" "$mp3"
+    log "合成完成 ${text:0:12}…（$(du -h "$mp3" 2>/dev/null | cut -f1)）"
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
+do_speak() {
+  local text="$1" mp3
+  if [ "$NO_NET" -eq 1 ]; then
+    log "离线模式"
+    fallback_say "$text"
+    printf '%s\t%s\t%s\n' "$(date '+%F %T')" "offline" "$text" >> "$CACHE/history.log"
+    return 0
+  fi
+  if ! ensure_chunk "$text"; then
+    log "合成失败（超时或断网），回退系统语音"
+    fallback_say "$text"
+    printf '%s\t%s\t%s\n' "$(date '+%F %T')" "fallback" "$text" >> "$CACHE/history.log"
+    return 0
+  fi
+  mp3="$(chunk_file "$text")"
+  printf '%s\t%s\t%s\n' "$(date '+%F %T')" "play" "$text" >> "$CACHE/history.log"
+  play_file "$mp3"
+}
+
+speak_text() {
+  local text="$1" i n=0 w prod f
+  local -a S=()
+  if [ "$NO_NET" -eq 1 ] || [ -z "$CHUNK" ] || [ -z "$PY" ]; then do_speak "$text"; return $?; fi
+  while IFS= read -r line; do [ -n "$line" ] && S+=("$line"); done \
+    < <(printf '%s' "$text" | "$PY" "$CHUNK" "$TTS_CHUNK_MIN" 2>/dev/null)
+  n=${#S[@]}
+  if [ "$n" -le 1 ]; then do_speak "$text"; return $?; fi
+  log "切成 $n 段，边播边合成"
+  ( for s in "${S[@]}"; do ensure_chunk "$s" || break; done ) &
+  prod=$!
+  for ((i = 0; i < n; i++)); do
+    f="$(chunk_file "${S[i]}")"
+    w=0
+    while [ ! -s "$f" ]; do
+      kill -0 "$prod" 2>/dev/null || break
+      w=$((w + 1))
+      [ "$w" -gt 600 ] && break
+      sleep 0.05
+    done
+    if [ -s "$f" ]; then
+      printf '%s\t%s\t%s\n' "$(date '+%F %T')" "play" "${S[i]}" >> "$CACHE/history.log"
+      play_file "$f" || { kill "$prod" 2>/dev/null; return 1; }
+    else
+      log "分句合成中断，整段回退"
+      kill "$prod" 2>/dev/null
+      fallback_say "$text"
+      return 0
+    fi
+  done
+  wait "$prod" 2>/dev/null
+  return 0
+}
+
+prune_cache() {
+  local cnt
+  cnt="$(find "$CACHE" -maxdepth 1 -name '*.mp3' 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "${cnt:-0}" -gt 200 ]; then
+    find "$CACHE" -maxdepth 1 -name '*.mp3' -print0 2>/dev/null \
+      | xargs -0 ls -1t 2>/dev/null | tail -n +121 \
+      | while IFS= read -r f; do rm -f "$f"; done
+  fi
+  find "$CACHE" -maxdepth 1 -name '*.mp3' -mtime +30 -delete 2>/dev/null
+}
+
+usage() {
+  cat <<'EOF'
+sayit —— 命令行语音播报
+
+用法: sayit [选项] "要播报的文字"   （不给文字时读标准输入）
+
+  -v 音色ID   默认 zh-CN-XiaoxiaoNeural
+  -r 语速     如 +10% / -5%，默认 +8%
+  -p 音调     如 +2Hz，默认 +0Hz
+  -g 音量     0~1（afplay / mpv 生效）
+  -b 后台播报，立即返回
+  -i 打断当前播报
+  -n 离线模式，用系统语音
+  -c 忽略缓存，强制重新合成
+  -d 打印调试信息
+  -l 列出可用中文音色
+  -s 查看当前配置
+  -h 帮助   -V 版本
+
+示例:
+  sayit -b "服务器已启动"
+  sayit -v zh-CN-YunxiNeural -r +12% "换男声，语速加快"
+  echo "**构建完成**" | sayit
+EOF
+}
+
+# ---- 后台 worker ----
+if [ "${1:-}" = "--_worker" ]; then
+  JOB="${2:-}"
+  [ -f "$JOB" ] || exit 1
+  . "$JOB"
+  TEXT=""
+  [ -n "${TEXTFILE:-}" ] && [ -f "$TEXTFILE" ] && TEXT="$(cat "$TEXTFILE")"
+  rm -f "$JOB" "${TEXTFILE:-}"
+  [ -z "$TEXT" ] && exit 0
+  speak_text "$TEXT"
+  exit $?
+fi
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -v) TTS_VOICE="${2:-}"; shift 2 ;;
+    -r) TTS_RATE="$(norm_rate "${2:-+0%}")"; shift 2 ;;
+    -p) TTS_PITCH="${2:-+0Hz}"; shift 2 ;;
+    -g) TTS_GAIN="${2:-}"; shift 2 ;;
+    -b) BG=1; shift ;;
+    -i) INTERRUPT=1; shift ;;
+    -n) NO_NET=1; shift ;;
+    -c) NO_CACHE=1; shift ;;
+    -d) DEBUG=1; shift ;;
+    -V|--version) printf 'sayit %s\n' "$VERSION"; exit 0 ;;
+    -l)
+      [ -z "$TTS_BIN" ] && { echo "未找到 edge-tts，请先运行 ./install.sh" >&2; exit 1; }
+      "$TTS_BIN" -l 2>/dev/null | grep -E "^zh-CN" | awk '{printf "%-32s %s\n", $1, $2}'
+      exit 0 ;;
+    -s)
+      printf '版本    %s\n音色    %s\n语速    %s\n音调    %s\n音量    %s\n超时    %ss\n分句阈值 %s 字\n回退    %s / %s\n播放器  %s\n缓存    %s（%s 个片段）\n' \
+        "$VERSION" "$TTS_VOICE" "$TTS_RATE" "$TTS_PITCH" "${TTS_GAIN:-原音量}" "$TTS_TIMEOUT" \
+        "$TTS_CHUNK_MIN" "$TTS_FALLBACK_VOICE" "$TTS_FALLBACK_RATE" "${PLAYER:-无}" "$CACHE" \
+        "$(find "$CACHE" -maxdepth 1 -name '*.mp3' 2>/dev/null | wc -l | tr -d ' ')"
+      exit 0 ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) printf 'sayit: 未知选项 %s（用 -h 查看帮助）\n' "$1" >&2; exit 2 ;;
+    *) break ;;
+  esac
+done
+
+TEXT="$*"
+if [ -z "$TEXT" ] && [ ! -t 0 ]; then TEXT="$(cat)"; fi
+[ -z "${TEXT// /}" ] && exit 0
+
+# ---- 文本口语化 ----
+NORM_TEXT=""
+if [ -n "$NORM" ] && [ -n "$PY" ]; then
+  NORM_TEXT="$(printf '%s' "$TEXT" | "$PY" "$NORM" "$LEX" 2>/dev/null)"
+fi
+[ -z "$NORM_TEXT" ] && NORM_TEXT="$TEXT"
+log "文本：$NORM_TEXT"
+
+# ---- 后台模式 ----
+if [ "$BG" -eq 1 ]; then
+  JOB="$CACHE/job-$$-$RANDOM"
+  printf '%s' "$NORM_TEXT" > "$JOB.txt"
+  {
+    printf "TTS_VOICE='%s'\n" "$TTS_VOICE"
+    printf "TTS_RATE='%s'\n" "$TTS_RATE"
+    printf "TTS_PITCH='%s'\n" "$TTS_PITCH"
+    printf "TTS_GAIN='%s'\n" "$TTS_GAIN"
+    printf "TTS_TIMEOUT='%s'\n" "$TTS_TIMEOUT"
+    printf "TTS_CHUNK_MIN='%s'\n" "$TTS_CHUNK_MIN"
+    printf "TTS_FALLBACK_VOICE='%s'\n" "$TTS_FALLBACK_VOICE"
+    printf "TTS_FALLBACK_RATE='%s'\n" "$TTS_FALLBACK_RATE"
+    printf "TEXTFILE='%s'\n" "$JOB.txt"
+  } > "$JOB"
+  nohup "$0" --_worker "$JOB" >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+  exit 0
+fi
+
+speak_text "$NORM_TEXT"
+rc=$?
+( prune_cache ) >/dev/null 2>&1 &
+exit $rc
