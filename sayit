@@ -115,15 +115,15 @@ synth() {  # $1 文本  $2 输出文件；失败自动重试 3 次
   return 1
 }
 
-fallback_say() {
+fallback_say() {  # 固定走 /usr/bin/say，避免被 PATH 里的 say 转发壳形成递归
   local text="$1"
   case "$(uname -s)" in
     Darwin)
-      if command -v say >/dev/null 2>&1; then
-        if say -v '?' 2>/dev/null | grep -q "^${TTS_FALLBACK_VOICE} "; then
-          say -v "$TTS_FALLBACK_VOICE" -r "$TTS_FALLBACK_RATE" "$text"
+      if [ -x /usr/bin/say ]; then
+        if /usr/bin/say -v '?' 2>/dev/null | grep -q "^${TTS_FALLBACK_VOICE} "; then
+          /usr/bin/say -v "$TTS_FALLBACK_VOICE" -r "$TTS_FALLBACK_RATE" "$text"
         else
-          say "$text"
+          /usr/bin/say "$text"
         fi
       fi ;;
     *)

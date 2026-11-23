@@ -69,6 +69,7 @@ echo "**构建完成** 🎉" | sayit           # 也支持管道输入
 | `-c` | 不使用缓存 |
 | `-d` | 打印调试信息（缓存命中、合成耗时、分句数） |
 | `-l` / `-s` | 列音色 / 看配置 |
+| `--check` | 音色自检：合成一句并播放，报告是否走了回退 |
 | `-h` / `-V` | 帮助 / 版本 |
 
 退出码：`0` 正常；`1` 播放器或合成均不可用；`2` 参数错误。
@@ -82,8 +83,8 @@ TTS_VOICE="zh-CN-XiaoxiaoNeural"
 TTS_RATE="+8%"
 TTS_PITCH="+0Hz"
 # TTS_GAIN="0.9"
-TTS_TIMEOUT="12"        # 合成超时，超时即回退
-TTS_CHUNK_MIN="80"      # 超过这么多字才分句流水线
+TTS_TIMEOUT="20"        # 单次合成超时，超时即重试，三次失败才回退
+TTS_CHUNK_MIN="120"     # 超过这么多字才分句流水线
 TTS_FALLBACK_VOICE="Tingting"
 TTS_FALLBACK_RATE="180"
 ```
@@ -111,9 +112,21 @@ TTS_FALLBACK_RATE="180"
 2. **分句**：`chunk.py` 把超过 80 字的长文本按句切开，合并过短句，避免碎片化。
 3. **流水线**：后台线程顺序合成、前台顺序播放，播第 N 句时第 N+1 句已经在生成，所以首句两三秒就出声，句间也没有空档。
 4. **缓存**：合成结果按「音色+语速+音调+文本」哈希存 mp3，超过 200 段或 30 天自动淘汰。
-5. **熔断回退**：`edge-tts` 单次请求超过 12 s 或返回空音频就判失败，直接交给系统语音，绝不干等。
+5. **重试与熔断回退**：单次请求 20 s 超时，失败自动重试 3 次（间隔 1s、2s），三次仍失败才交给系统语音，并写入 `history.log` 与 `last-error.log`，不会静默降级。
 
 缓存位置：macOS `~/Library/Caches/sayit`，Linux `${XDG_CACHE_HOME:-~/.cache}/sayit`。`history.log` 记录最近播报过的内容，`last-error.log` 留存合成失败原因。
+
+## 接管系统 `say`（可选）
+
+其他脚本或工具直接调用 macOS 的 `say` 时，出来的是系统合成音（明显更机械）。可以让 `sayit` 接管：
+
+```bash
+install -m 0755 extras/say-shim.sh ~/.local/bin/say
+```
+
+之后 `~/.local/bin` 在 PATH 中排在 `/usr/bin` 前面时，凡是 `say "文本"`、`say -f 文本文件`、`echo 文本 | say` 都会自动改走神经音色；而 `say -o out.aiff`、`say -v ?`、`say --help` 这类需要系统能力的调用原样交给 `/usr/bin/say`。删除 `~/.local/bin/say` 即可恢复原状。
+
+`sayit` 自身的回退固定调用 `/usr/bin/say`，因此不会和转发壳互相递归。
 
 ## 兼容性
 
